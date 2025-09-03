@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Batch OCR Script using TrOCR
+Batch OCR Script with Multiple OCR Engines
 Processes PDF files and images in a folder, transcribing each to a text file.
+Supports EasyOCR (recommended for documents), Tesseract, and TrOCR engines.
 """
 
 import os
@@ -20,6 +21,10 @@ try:
     from pdf2image import convert_from_path
     import fitz  # PyMuPDF for better PDF handling
     from tqdm import tqdm
+    import easyocr
+    import pytesseract
+    import cv2
+    import numpy as np
 except ImportError as e:
     print(f"Missing required dependency: {e}")
     print("Please install requirements with: pip install -r requirements.txt")
@@ -30,32 +35,115 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-class TrOCRBatchProcessor:
-    """Batch OCR processor using TrOCR for PDFs and images."""
+class BatchOCRProcessor:
+    """Batch OCR processor supporting multiple OCR engines for PDFs and images."""
     
-    def __init__(self, model_name: str = "microsoft/trocr-base-handwritten"):
+    def __init__(self, ocr_engine: str = "easyocr", model_name: str = "microsoft/trocr-base-printed"):
         """
-        Initialize the TrOCR processor.
+        Initialize the OCR processor.
         
         Args:
-            model_name: Hugging Face model name for TrOCR
+            ocr_engine: OCR engine to use ('easyocr', 'tesseract', or 'trocr')
+            model_name: Hugging Face model name for TrOCR (only used if ocr_engine='trocr')
         """
-        logger.info(f"Loading TrOCR model: {model_name}")
-        self.processor = TrOCRProcessor.from_pretrained(model_name)
-        self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
-        
-        # Use GPU if available
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        logger.info(f"Using device: {self.device}")
+        self.ocr_engine = ocr_engine.lower()
         
         # Supported image formats
         self.image_extensions = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.gif'}
         self.pdf_extensions = {'.pdf'}
+        
+        # Initialize the selected OCR engine
+        if self.ocr_engine == "easyocr":
+            logger.info("Initializing EasyOCR (supports 80+ languages)")
+            self.reader = easyocr.Reader(['en'])  # Can add more languages: ['en', 'es', 'fr', etc.]
+            logger.info("EasyOCR initialized successfully")
+            
+        elif self.ocr_engine == "tesseract":
+            logger.info("Using Tesseract OCR")
+            # Test if tesseract is available
+            try:
+                pytesseract.get_tesseract_version()
+                logger.info("Tesseract OCR initialized successfully")
+            except Exception as e:
+                logger.error(f"Tesseract not found: {e}")
+                logger.error("Please install tesseract: https://github.com/tesseract-ocr/tesseract")
+                sys.exit(1)
+                
+        elif self.ocr_engine == "trocr":
+            logger.info(f"Loading TrOCR model: {model_name}")
+            self.processor = TrOCRProcessor.from_pretrained(model_name)
+            self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
+            
+            # Use GPU if available
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
+            logger.info(f"TrOCR initialized on device: {self.device}")
+            
+        else:
+            raise ValueError(f"Unsupported OCR engine: {ocr_engine}. Use 'easyocr', 'tesseract', or 'trocr'")
+    
+    def preprocess_image(self, image: Image.Image) -> Image.Image:
+        """
+        Preprocess image for better OCR results.
+        
+        Args:
+            image: PIL Image object
+            
+        Returns:
+            Preprocessed PIL Image
+        """
+        try:
+            # Ensure image is in RGB format first
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            # Convert PIL to OpenCV format (RGB to BGR)
+            img_array = np.array(image)
+            
+            # Ensure we have a valid image array
+            if img_array.dtype != np.uint8:
+                img_array = img_array.astype(np.uint8)
+            
+            # Convert RGB to BGR for OpenCV
+            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
+                img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            else:
+                img_bgr = img_array
+            
+            # Convert to grayscale
+            if len(img_bgr.shape) == 3:
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_bgr
+            
+            # Ensure gray is uint8
+            if gray.dtype != np.uint8:
+                gray = gray.astype(np.uint8)
+            
+            # Apply slight Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(gray, (1, 1), 0)
+            
+            # Apply adaptive thresholding for better text contrast
+            binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                         cv2.THRESH_BINARY, 11, 2)
+            
+            # Convert back to PIL Image
+            processed_image = Image.fromarray(binary)
+            if processed_image.mode != 'RGB':
+                processed_image = processed_image.convert('RGB')
+            
+            return processed_image
+            
+        except Exception as e:
+            logger.warning(f"Image preprocessing failed: {e}, using original image")
+            # Return original image if preprocessing fails
+            if image.mode != 'RGB':
+                return image.convert('RGB')
+            return image
     
     def extract_text_from_image(self, image: Image.Image) -> str:
         """
-        Extract text from a PIL Image using TrOCR.
+        Extract text from a PIL Image using the selected OCR engine.
         
         Args:
             image: PIL Image object
@@ -63,20 +151,91 @@ class TrOCRBatchProcessor:
         Returns:
             Extracted text as string
         """
-        # Ensure image is in RGB format
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Process image
-        pixel_values = self.processor(image, return_tensors="pt").pixel_values.to(self.device)
-        
-        # Generate text
-        with torch.no_grad():
-            generated_ids = self.model.generate(pixel_values)
-        
-        # Decode generated text
-        generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        return generated_text.strip()
+        try:
+            if self.ocr_engine == "easyocr":
+                # Ensure image is in RGB format
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                    
+                # Convert PIL to numpy array for EasyOCR
+                img_array = np.array(image)
+                
+                # Ensure the array is uint8
+                if img_array.dtype != np.uint8:
+                    img_array = img_array.astype(np.uint8)
+                
+                # EasyOCR works well with both original and preprocessed images
+                # Try original first, then preprocessed if result is poor
+                result = self.reader.readtext(img_array, paragraph=True, width_ths=0.7, height_ths=0.7)
+                
+                extracted_text = ''
+                if result:
+                    # Extract text from results
+                    text_parts = []
+                    for detection in result:
+                        text = detection[1].strip()
+                        confidence = detection[2]
+                        # Only include text with reasonable confidence
+                        if text and confidence > 0.3:
+                            text_parts.append(text)
+                    
+                    extracted_text = '\n'.join(text_parts)
+                
+                # If result is poor (too short), try with preprocessed image
+                if not extracted_text or len(extracted_text.strip()) < 10:
+                    try:
+                        logger.debug("Trying with preprocessed image for better results")
+                        processed_image = self.preprocess_image(image)
+                        img_array = np.array(processed_image)
+                        
+                        if img_array.dtype != np.uint8:
+                            img_array = img_array.astype(np.uint8)
+                            
+                        result = self.reader.readtext(img_array, paragraph=True, width_ths=0.7, height_ths=0.7)
+                        
+                        if result:
+                            text_parts = []
+                            for detection in result:
+                                text = detection[1].strip()
+                                confidence = detection[2]
+                                if text and confidence > 0.3:
+                                    text_parts.append(text)
+                            
+                            preprocessed_text = '\n'.join(text_parts)
+                            if len(preprocessed_text.strip()) > len(extracted_text.strip()):
+                                extracted_text = preprocessed_text
+                                
+                    except Exception as preprocess_error:
+                        logger.warning(f"Preprocessing failed: {preprocess_error}")
+                
+                return extracted_text if extracted_text else "No text detected"
+            
+            elif self.ocr_engine == "tesseract":
+                # Preprocess image for better Tesseract results
+                processed_image = self.preprocess_image(image)
+                
+                # Use Tesseract with custom config for better accuracy
+                custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .,!?;:\'"()-'
+                text = pytesseract.image_to_string(processed_image, config=custom_config)
+                return text.strip()
+            
+            elif self.ocr_engine == "trocr":
+                # TrOCR works best on cropped text regions, not full documents
+                # This is kept for compatibility but not recommended for full documents
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
+                pixel_values = self.processor(image, return_tensors="pt").pixel_values.to(self.device)
+                
+                with torch.no_grad():
+                    generated_ids = self.model.generate(pixel_values)
+                
+                generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                return generated_text.strip()
+            
+        except Exception as e:
+            logger.error(f"Error in OCR processing: {e}")
+            return f"Error extracting text: {e}"
     
     def process_pdf(self, pdf_path: Path) -> str:
         """
@@ -278,7 +437,7 @@ class TrOCRBatchProcessor:
 def main():
     """Main function with command-line interface."""
     parser = argparse.ArgumentParser(
-        description="Batch OCR processing using TrOCR for PDFs and images"
+        description="Batch OCR processing with multiple engine support for PDFs and images"
     )
     parser.add_argument(
         "input_folder",
@@ -291,18 +450,28 @@ def main():
         help="Output folder for transcribed text files (default: same as input)"
     )
     parser.add_argument(
+        "--engine",
+        type=str,
+        default="easyocr",
+        choices=["easyocr", "tesseract", "trocr"],
+        help="""OCR engine to use (default: easyocr).
+Engines:
+  easyocr: Best for documents, supports 80+ languages, good accuracy
+  tesseract: Classic OCR, good for clean documents, requires tesseract installation
+  trocr: Transformer-based, best for handwritten text or single lines"""
+    )
+    parser.add_argument(
         "--model",
         type=str,
-        default="microsoft/trocr-base-handwritten",
-        help="""TrOCR model to use (default: microsoft/trocr-base-handwritten).
+        default="microsoft/trocr-base-printed",
+        help="""TrOCR model to use (only used with --engine trocr).
 Available models:
   Handwritten text:
-    - microsoft/trocr-base-handwritten (default, ~334MB, fast)
+    - microsoft/trocr-base-handwritten (~334MB, fast)
     - microsoft/trocr-large-handwritten (~1.3GB, more accurate)
   Printed text:
-    - microsoft/trocr-base-printed (~334MB, fast, good for PDFs)
-    - microsoft/trocr-large-printed (~1.3GB, more accurate)
-Use printed models for typed documents/PDFs, handwritten models for handwritten content."""
+    - microsoft/trocr-base-printed (default, ~334MB, fast, good for documents)
+    - microsoft/trocr-large-printed (~1.3GB, more accurate)"""
     )
     parser.add_argument(
         "--override",
@@ -335,7 +504,7 @@ Use printed models for typed documents/PDFs, handwritten models for handwritten 
     
     # Initialize processor and run batch processing
     try:
-        processor = TrOCRBatchProcessor(model_name=args.model)
+        processor = BatchOCRProcessor(ocr_engine=args.engine, model_name=args.model)
         processor.batch_process(input_folder, output_folder, override=args.override)
     except KeyboardInterrupt:
         logger.info("\nProcessing interrupted by user")
