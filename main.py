@@ -10,6 +10,8 @@ import logging
 from pathlib import Path
 from typing import List, Union
 import sys
+import time
+from tqdm import tqdm
 
 try:
     from transformers import TrOCRProcessor, VisionEncoderDecoderModel
@@ -17,6 +19,7 @@ try:
     import torch
     from pdf2image import convert_from_path
     import fitz  # PyMuPDF for better PDF handling
+    from tqdm import tqdm
 except ImportError as e:
     print(f"Missing required dependency: {e}")
     print("Please install requirements with: pip install -r requirements.txt")
@@ -173,13 +176,14 @@ class TrOCRBatchProcessor:
             logger.warning(f"Unsupported file type: {file_path}")
             return f"Unsupported file type: {extension}"
     
-    def batch_process(self, input_folder: Path, output_folder: Path = None) -> None:
+    def batch_process(self, input_folder: Path, output_folder: Path = None, override: bool = False) -> None:
         """
         Process all supported files in a folder.
         
         Args:
             input_folder: Folder containing files to process
             output_folder: Folder to save output files (defaults to input_folder)
+            override: If True, process all files even if output exists
         """
         if output_folder is None:
             output_folder = input_folder
@@ -197,24 +201,78 @@ class TrOCRBatchProcessor:
             logger.warning(f"No supported files found in {input_folder}")
             return
         
-        logger.info(f"Found {len(supported_files)} files to process")
+        # Filter out files that already have output unless override is specified
+        files_to_process = []
+        skipped_count = 0
         
-        for i, file_path in enumerate(supported_files, 1):
-            logger.info(f"Processing file {i}/{len(supported_files)}: {file_path.name}")
-            
-            # Extract text
-            extracted_text = self.process_file(file_path)
-            
-            # Save to output file
+        for file_path in supported_files:
             output_file = output_folder / f"{file_path.name}.txt"
-            try:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    f.write(extracted_text)
-                logger.info(f"Saved transcription to: {output_file}")
-            except Exception as e:
-                logger.error(f"Error saving output file {output_file}: {e}")
+            if output_file.exists() and not override:
+                skipped_count += 1
+                logger.debug(f"Skipping {file_path.name} - output already exists")
+            else:
+                files_to_process.append(file_path)
         
-        logger.info("Batch processing completed!")
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} files with existing output (use --override to reprocess)")
+        
+        if not files_to_process:
+            logger.info("No files to process (all outputs already exist)")
+            return
+        
+        logger.info(f"Found {len(supported_files)} total files, processing {len(files_to_process)} files")
+        
+        # Initialize timing and statistics
+        start_time = time.time()
+        processed_count = 0
+        total_chars = 0
+        
+        # Process files with progress bar
+        with tqdm(files_to_process, desc="Processing files", unit="file") as pbar:
+            for file_path in pbar:
+                file_start_time = time.time()
+                
+                # Update progress bar description
+                pbar.set_description(f"Processing {file_path.name}")
+                
+                # Extract text
+                extracted_text = self.process_file(file_path)
+                
+                # Save to output file
+                output_file = output_folder / f"{file_path.name}.txt"
+                try:
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(extracted_text)
+                    
+                    # Update statistics
+                    processed_count += 1
+                    total_chars += len(extracted_text)
+                    file_time = time.time() - file_start_time
+                    elapsed_time = time.time() - start_time
+                    
+                    # Calculate statistics
+                    avg_time_per_file = elapsed_time / processed_count
+                    files_per_sec = processed_count / elapsed_time
+                    chars_per_sec = total_chars / elapsed_time
+                    
+                    # Update progress bar with statistics
+                    pbar.set_postfix({
+                        'files/sec': f'{files_per_sec:.2f}',
+                        'chars/sec': f'{chars_per_sec:.0f}',
+                        'avg_time': f'{avg_time_per_file:.1f}s'
+                    })
+                    
+                    logger.debug(f"Saved transcription to: {output_file} ({len(extracted_text)} chars, {file_time:.1f}s)")
+                    
+                except Exception as e:
+                    logger.error(f"Error saving output file {output_file}: {e}")
+        
+        # Final statistics
+        total_time = time.time() - start_time
+        logger.info(f"\nBatch processing completed!")
+        logger.info(f"Processed {processed_count} files in {total_time:.1f} seconds")
+        logger.info(f"Average: {total_time/processed_count:.1f}s per file, {processed_count/total_time:.2f} files/sec")
+        logger.info(f"Total characters extracted: {total_chars:,} ({total_chars/total_time:.0f} chars/sec)")
 
 
 def main():
@@ -247,6 +305,11 @@ Available models:
 Use printed models for typed documents/PDFs, handwritten models for handwritten content."""
     )
     parser.add_argument(
+        "--override",
+        action="store_true",
+        help="Override existing output files and reprocess all files"
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging"
@@ -273,9 +336,9 @@ Use printed models for typed documents/PDFs, handwritten models for handwritten 
     # Initialize processor and run batch processing
     try:
         processor = TrOCRBatchProcessor(model_name=args.model)
-        processor.batch_process(input_folder, output_folder)
+        processor.batch_process(input_folder, output_folder, override=args.override)
     except KeyboardInterrupt:
-        logger.info("Processing interrupted by user")
+        logger.info("\nProcessing interrupted by user")
         sys.exit(0)
     except Exception as e:
         logger.error(f"Error during processing: {e}")
