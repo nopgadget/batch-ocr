@@ -166,18 +166,26 @@ class BatchOCRProcessor:
                 
                 # EasyOCR works well with both original and preprocessed images
                 # Try original first, then preprocessed if result is poor
+                logger.debug(f"Running EasyOCR on image with shape: {img_array.shape}, dtype: {img_array.dtype}")
                 result = self.reader.readtext(img_array, paragraph=True, width_ths=0.7, height_ths=0.7)
+                logger.debug(f"EasyOCR returned {len(result) if result else 0} detections")
                 
                 extracted_text = ''
-                if result:
+                if result and len(result) > 0:
                     # Extract text from results
                     text_parts = []
                     for detection in result:
-                        text = detection[1].strip()
-                        confidence = detection[2]
-                        # Only include text with reasonable confidence
-                        if text and confidence > 0.3:
-                            text_parts.append(text)
+                        try:
+                            # EasyOCR returns [bbox, text, confidence]
+                            if len(detection) >= 2:
+                                text = str(detection[1]).strip()
+                                confidence = detection[2] if len(detection) > 2 else 1.0
+                                # Only include text with reasonable confidence
+                                if text and confidence > 0.3:
+                                    text_parts.append(text)
+                        except (IndexError, TypeError) as e:
+                            logger.debug(f"Skipping malformed detection result: {e}")
+                            continue
                     
                     extracted_text = '\n'.join(text_parts)
                 
@@ -193,13 +201,19 @@ class BatchOCRProcessor:
                             
                         result = self.reader.readtext(img_array, paragraph=True, width_ths=0.7, height_ths=0.7)
                         
-                        if result:
+                        if result and len(result) > 0:
                             text_parts = []
                             for detection in result:
-                                text = detection[1].strip()
-                                confidence = detection[2]
-                                if text and confidence > 0.3:
-                                    text_parts.append(text)
+                                try:
+                                    # EasyOCR returns [bbox, text, confidence]
+                                    if len(detection) >= 2:
+                                        text = str(detection[1]).strip()
+                                        confidence = detection[2] if len(detection) > 2 else 1.0
+                                        if text and confidence > 0.3:
+                                            text_parts.append(text)
+                                except (IndexError, TypeError) as e:
+                                    logger.debug(f"Skipping malformed detection result in preprocessing: {e}")
+                                    continue
                             
                             preprocessed_text = '\n'.join(text_parts)
                             if len(preprocessed_text.strip()) > len(extracted_text.strip()):
